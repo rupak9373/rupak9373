@@ -7,59 +7,71 @@ export default async function handler(req, res) {
   if (allowedOrigins.has(origin)) res.setHeader('Access-Control-Allow-Origin', origin);
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Cache-Control', 's-maxage=300, stale-while-revalidate=600');
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' });
 
   const q = String(req.query.q || '').trim();
   if (!q) return res.status(400).json({ error: 'Search text is required' });
 
+  const esc = q.replace(/["\\]/g, ' ').trim();
   const params = new URLSearchParams({
-    action: 'query',
-    generator: 'search',
-    gsrsearch: q,
-    gsrnamespace: '6',
-    gsrlimit: '35',
-    prop: 'imageinfo',
-    iiprop: 'url|mime|extmetadata',
-    iiurlwidth: '500',
-    format: 'json',
-    origin: '*'
+    q: `mediatype:audio AND (${esc})`,
+    fl: 'identifier,title,creator,licenseurl,description',
+    rows: '18',
+    page: '1',
+    output: 'json',
+    sort: 'downloads desc'
   });
 
   try {
-    const r = await fetch(`https://commons.wikimedia.org/w/api.php?${params.toString()}`, {
-      headers: { 'User-Agent': 'RupakPlay/1.1 (legal audio search)' }
+    const sr = await fetch(`https://archive.org/advancedsearch.php?${params.toString()}`, {
+      headers: { 'User-Agent': 'RupakPlay/1.2' }
     });
-    const data = await r.json();
-    if (!r.ok) return res.status(r.status).json({ error: 'Music search failed' });
+    const sdata = await sr.json();
+    if (!sr.ok) return res.status(sr.status).json({ error: 'Music search failed' });
 
-    const strip = (html = '') => String(html)
-      .replace(/<[^>]*>/g, '')
-      .replace(/&amp;/g, '&')
-      .replace(/&#39;/g, "'")
-      .replace(/&quot;/g, '"')
-      .replace(/&nbsp;/g, ' ')
-      .trim();
+    const docs = sdata?.response?.docs || [];
+    const picked = [];
 
-    const pages = Object.values(data?.query?.pages || {});
-    const items = pages.map(p => {
-      const ii = p.imageinfo?.[0] || {};
-      const meta = ii.extmetadata || {};
-      const mime = String(ii.mime || '');
-      return {
-        id: String(p.pageid || p.title || ''),
-        title: String(p.title || '').replace(/^File:/i, '').replace(/\.[^.]+$/, ''),
-        artist: strip(meta.Artist?.value || meta.Credit?.value || 'Wikimedia Commons'),
-        license: strip(meta.LicenseShortName?.value || meta.UsageTerms?.value || 'Open license'),
-        audioUrl: ii.url || '',
-        downloadUrl: ii.url || '',
-        sourceUrl: ii.descriptionurl || '',
-        thumbnail: ii.thumburl || '',
-        mime
-      };
-    }).filter(x => x.audioUrl && (x.mime.startsWith('audio/') || /\.(mp3|ogg|oga|wav|flac|opus|m4a|webm)(\?|$)/i.test(x.audioUrl)));
+    for (const doc of docs) {
+      if (picked.length >= 12) break;
+      try {
+        const mr = await fetch(`https://archive.org/metadata/${encodeURIComponent(doc.identifier)}`);
+        if (!mr.ok) continue;
+        const meta = await mr.json();
+        const files = Array.isArray(meta.files) ? meta.files : [];
 
-    return res.status(200).json({ items: items.slice(0, 24) });
+        const audioFile = files.find(f => {
+          const name = String(f.name || '');
+          const format = String(f.format || '').toLowerCase();
+          return !name.includes('_files.xml') && !name.includes('_meta.xml') && (
+            /\.(mp3|ogg|oga|wav|flac|opus|m4a)$/i.test(name) ||
+            format.includes('mp3') || format.includes('ogg') || format.includes('flac') || format.includes('wav')
+          );
+        });
+        if (!audioFile?.name) continue;
+
+        const id = doc.identifier;
+        const fileUrl = `https://archive.org/download/${encodeURIComponent(id)}/${audioFile.name.split('/').map(encodeURIComponent).join('/')}`;
+        const thumb = `https://archive.org/services/img/${encodeURIComponent(id)}`;
+        const md = meta.metadata || {};
+        const license = md.licenseurl || doc.licenseurl || md.rights || 'Internet Archive';
+
+        picked.push({
+          id,
+          title: String(md.title || doc.title || id),
+          artist: String(md.creator || doc.creator || 'Unknown artist'),
+          license: Array.isArray(license) ? String(license[0] || 'Internet Archive') : String(license),
+          audioUrl: fileUrl,
+          downloadUrl: fileUrl,
+          sourceUrl: `https://archive.org/details/${encodeURIComponent(id)}`,
+          thumbnail: thumb
+        });
+      } catch (_) {}
+    }
+
+    return res.status(200).json({ items: picked });
   } catch (e) {
     return res.status(500).json({ error: 'Music service unavailable' });
   }
